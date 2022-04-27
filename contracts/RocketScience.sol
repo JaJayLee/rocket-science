@@ -2,7 +2,11 @@
 pragma solidity >=0.8.6;
 
 import "./Ownable.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
+
+enum WithdrawalType {
+    EARNED,
+    REFERRALS
+}
 
 struct Packet {
     uint256 id;
@@ -23,7 +27,7 @@ struct Investor {
 struct Withdrawal {
     uint256 amount;
     uint256 timestamp;
-    uint256 t; // 1 - earned withdrawals, 2 - referrals withdrawals
+    WithdrawalType t;
 }
 
 struct ReferralReward {
@@ -32,22 +36,25 @@ struct ReferralReward {
     uint256 timestamp;
 }
 
+
+
 contract RocketScience is Ownable {
-    using SafeMath for uint256;
 
     uint256 public constant PACKET_LIFETIME = 15 days;
     uint256 public constant DAY = 1 days;
-    uint256 public constant REF = 10;
+    uint256 public constant REFERRAL_PERCENTAGE = 10;
+    uint256 public constant TOTAL_REWARD = 225;
+    uint256 public constant PERCENTAGE_OF_OWNER_REWARD = 10;
 
     uint256 public constant DAILY_REWARD = 15; // %
 
     uint256 public totalInvest;
     uint256 public totalInvestors;
 
-    mapping(address => Investor) investors;
+    mapping(address => Investor) public investors;
     mapping(address => mapping(uint256 => uint256)) lastUpdate;
 
-    mapping(address => uint256) refRewards;
+    mapping(address => uint256) public refRewards;
 
     mapping(address => Withdrawal[]) withdrawals;
     mapping(address => ReferralReward[]) referralsRewards;
@@ -57,9 +64,8 @@ contract RocketScience is Ownable {
     mapping(address => Packet[]) userPackets;
     mapping(address => uint256) packetNumbers;
 
-    //receive() external payable{}
     fallback() external payable{
-        payable(msg.sender).transfer(msg.value);
+        sendValue(payable(msg.sender), msg.value);
     }
 
     constructor() {
@@ -70,16 +76,27 @@ contract RocketScience is Ownable {
         totalInvestors++;
     }
 
-    function invest() public payable {
+    function sendValue(address payable recipient, uint256 amount) internal {
+        require(address(this).balance >= amount, "Address: insufficient balance");
+
+        (bool success, ) = recipient.call{value: amount}("");
+        require(success, "Address: unable to send value, recipient may have reverted");
+    }
+
+    function min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
+    }
+
+    function invest() external payable {
         require(
-            msg.value >= 10000000000000000 &&
-                msg.value <= 1000000000000000000000,
+            msg.value >= 1e16 &&
+                msg.value <= 1e21,
             "Wrong amount"
         );
 
         uint256 _packetId = packetNumbers[msg.sender];
 
-        uint256 _earn = msg.value.mul(REF).div(100);
+        uint256 _earn = msg.value * REFERRAL_PERCENTAGE / 100;
 
         address _referrer = investors[msg.sender].referrer;
         if (_referrer != address(0)) {
@@ -106,7 +123,7 @@ contract RocketScience is Ownable {
 
         packetNumbers[msg.sender]++;
         totalInvest += msg.value;
-        payable(owner()).transfer(msg.value.div(10));
+        sendValue(payable(owner()), msg.value / PERCENTAGE_OF_OWNER_REWARD);
     }
 
     function _update(
@@ -132,25 +149,23 @@ contract RocketScience is Ownable {
         }
     }
 
-    function investByRef(address _referrer) public payable {
-        require(msg.sender != _referrer, "You can't invest to youself");
+    function investByRef(address _referrer) external payable {
+        require(msg.sender != _referrer, "You can't invest to yourself");
         require(
-            msg.value >= 10000000000000000 &&
-                msg.value <= 1000000000000000000000,
+            msg.value >= 1e16 &&
+                msg.value <= 1e21,
             "Wrong amount"
         );
+        require(_referrer != address(0), "Referrer can not be a null address");
 
-        bool _isNew;
-        if (investors[msg.sender].referrer == address(0)) _isNew = true;
-        else _referrer = investors[msg.sender].referrer;
-
-        if (_isNew) {
+        if (investors[msg.sender].referrer == address(0)) {
             investors[msg.sender].referrer = _referrer;
             totalInvestors++;
         }
+        else _referrer = investors[msg.sender].referrer;
 
         uint256 _packetId = packetNumbers[msg.sender];
-        uint256 _earn = msg.value.mul(REF).div(100);
+        uint256 _earn = msg.value * REFERRAL_PERCENTAGE / 100;
         _update(msg.sender, _referrer, _earn);
 
         investors[msg.sender].totalInvested += msg.value;
@@ -170,47 +185,25 @@ contract RocketScience is Ownable {
         packetNumbers[msg.sender]++;
 
         totalInvest += msg.value;
-        payable(owner()).transfer(msg.value.div(10));
+        sendValue(payable(owner()), msg.value / PERCENTAGE_OF_OWNER_REWARD);
     }
 
-    function takeInvestment(uint256 _packetId) public {
+    function takeInvestment(uint256 _packetId) external {
         require(packetNumbers[msg.sender] > _packetId, "Packet doesn't exist");
 
-        uint256 _earned;
-        if (
-            block.timestamp > userPackets[msg.sender][_packetId].finishTime &&
-            lastUpdate[msg.sender][_packetId] >
-            userPackets[msg.sender][_packetId].finishTime
-        ) {
-            _earned = 0;
-        } else if (
-            block.timestamp > userPackets[msg.sender][_packetId].finishTime &&
-            lastUpdate[msg.sender][_packetId] <
-            userPackets[msg.sender][_packetId].finishTime
-        ) {
-            _earned = userPackets[msg.sender][_packetId].invested.mul(225).div(100).sub(
-                userPackets[msg.sender][_packetId].paid
-            );
-        } else {
-            _earned = userPackets[msg.sender][_packetId]
-                .invested
-                .mul(DAILY_REWARD)
-                .mul(block.timestamp - lastUpdate[msg.sender][_packetId])
-                .div(DAY)
-                .div(100);
-        }
+        uint256 _earned = totalClaimable(_packetId, msg.sender);
 
         lastUpdate[msg.sender][_packetId] = block.timestamp;
         investors[msg.sender].earned += _earned;
 
         userPackets[msg.sender][_packetId].paid += _earned;
 
-        payable(msg.sender).transfer(_earned);
+        sendValue(payable(msg.sender), _earned);
 
         Withdrawal memory _withdrawal = Withdrawal({
             amount: _earned,
             timestamp: block.timestamp,
-            t: 1
+            t: WithdrawalType.EARNED
         });
 
         withdrawals[msg.sender].push(_withdrawal);
@@ -223,71 +216,39 @@ contract RocketScience is Ownable {
     {
         require(packetNumbers[_user] > _packetId, "Packet doesn't exist");
 
-        uint256 _earned;
-        if (
-            block.timestamp > userPackets[_user][_packetId].finishTime &&
-            lastUpdate[_user][_packetId] >
-            userPackets[_user][_packetId].finishTime
-        ) {
-            _earned = 0;
-        } else if (
-            block.timestamp > userPackets[_user][_packetId].finishTime &&
-            lastUpdate[_user][_packetId] <
-            userPackets[_user][_packetId].finishTime
-        ) {
-            _earned = userPackets[_user][_packetId].invested.mul(225).div(100).sub(
-                userPackets[_user][_packetId].paid
-            );
-        } else {
-            _earned = userPackets[_user][_packetId]
-                .invested
-                .mul(DAILY_REWARD)
-                .mul(block.timestamp - lastUpdate[_user][_packetId])
-                .div(DAY)
-                .div(100);
-        }
+        uint256 _end = min(block.timestamp, userPackets[_user][_packetId].finishTime);
+
+        uint256 _elapsed = 0;
+        if(_end > lastUpdate[_user][_packetId])
+            _elapsed = _end - lastUpdate[_user][_packetId];
+
+        uint256 _earned = userPackets[_user][_packetId].invested * DAILY_REWARD * _elapsed / DAY / 100;
 
         return _earned;
     }
 
-    function getReferralRewards() public {
+    function getReferralRewards() external {
         uint256 _reward = refRewards[msg.sender];
 
         refRewards[msg.sender] = 0;
 
-        payable(msg.sender).transfer(_reward);
+        sendValue(payable(msg.sender), _reward);
 
         Withdrawal memory _withdrawal = Withdrawal({
             amount: _reward,
             timestamp: block.timestamp,
-            t: 2
+            t: WithdrawalType.REFERRALS
         });
 
         withdrawals[msg.sender].push(_withdrawal);
     }
 
     function transfer() external payable {
-        payable(msg.sender).transfer(msg.value);
+        sendValue(payable(msg.sender), msg.value);
     }
-
-    function getInvestor(address _investor)
-        public
-        view
-        returns (Investor memory)
-    {
-        return investors[_investor];
-    }
-
-    // function getAllPackets(address _user)
-    //     public
-    //     view
-    //     returns (Packet[] memory)
-    // {
-    //     return userPackets[_user];
-    // }
 
     function getActivePackets(address _user)
-        public
+        external
         view
         returns (Packet[] memory)
     {
@@ -295,7 +256,7 @@ contract RocketScience is Ownable {
 
         uint256 _size = 0;
         for (uint256 i = 0; i < _allPackets.length; i++) {
-            if (_allPackets[i].finishTime > block.timestamp || _allPackets[i].paid < _allPackets[i].invested.mul(224).div(100)) {
+            if (_allPackets[i].finishTime > block.timestamp || _allPackets[i].paid < _allPackets[i].invested * TOTAL_REWARD / 100) {
                 _size++;
             }
         }
@@ -304,7 +265,7 @@ contract RocketScience is Ownable {
 
         uint256 _id = 0;
         for (uint256 i = 0; i < _allPackets.length; i++) {
-            if (_allPackets[i].finishTime > block.timestamp || _allPackets[i].paid < _allPackets[i].invested.mul(224).div(100)) {
+            if (_allPackets[i].finishTime > block.timestamp || _allPackets[i].paid < _allPackets[i].invested * TOTAL_REWARD / 100) {
                 _packets[_id++] = _allPackets[i];
             }
         }
@@ -313,7 +274,7 @@ contract RocketScience is Ownable {
     }
 
     function getCompletedPackets(address _user)
-        public
+        external
         view
         returns (Packet[] memory)
     {
@@ -321,7 +282,7 @@ contract RocketScience is Ownable {
 
         uint256 _size = 0;
         for (uint256 i = 0; i < _allPackets.length; i++) {
-            if (_allPackets[i].finishTime < block.timestamp && _allPackets[i].paid > _allPackets[i].invested.mul(224).div(100)) {
+            if (_allPackets[i].paid == _allPackets[i].invested * TOTAL_REWARD / 100) {
                 _size++;
             }
         }
@@ -330,16 +291,12 @@ contract RocketScience is Ownable {
 
         uint256 _id = 0;
         for (uint256 i = 0; i < _allPackets.length; i++) {
-            if (_allPackets[i].finishTime < block.timestamp && _allPackets[i].paid > _allPackets[i].invested.mul(224).div(100)) {
+            if (_allPackets[i].paid == _allPackets[i].invested * TOTAL_REWARD / 100) {
                 _packets[_id++] = _allPackets[i];
             }
         }
 
         return _packets;
-    }
-
-    function getCurrentRefRewards(address _user) public view returns (uint256) {
-        return refRewards[_user];
     }
 
     function getWithdrawals(address _user)
